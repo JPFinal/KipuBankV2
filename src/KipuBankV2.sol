@@ -1,99 +1,110 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title KipuBank - Personal ETH vault with secure limits
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+/// @title KipuBankV2 - Multi-token vault with access control and Chainlink integration
 /// @author Juan
-/// @notice Allows users to deposit and withdraw ETH with per-user and global limits
-contract KipuBank {
-    /// @notice Global deposit cap for the contract
-    /// @dev Immutable, set at deployment
-    uint256 public immutable bankCap;
+/// @notice Allows deposits and withdrawals in ETH and ERC-20 tokens with USD-based limits
+contract KipuBankV2 is AccessControl {
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    /// @notice Maximum withdrawal allowed per transaction
-    /// @dev Immutable, set at deployment
-    uint256 public immutable withdrawLimit;
+    /// @notice Chainlink ETH/USD price feed
+    AggregatorV3Interface public immutable priceFeed;
 
-    /// @notice Total ETH deposited across all users
-    uint256 public totalDeposited;
+    /// @notice USD cap for total deposits (scaled to 6 decimals)
+    uint256 public constant BANK_CAP_USD = 1000000 * 10**6; // 1,000,000 USD
 
-    /// @notice Total number of deposit operations
-    uint256 public depositCount;
+    /// @notice Mapping of user balances per token
+    mapping(address => mapping(address => uint256)) public balances;
 
-    /// @notice Total number of withdrawal operations
-    uint256 public withdrawalCount;
+    /// @notice Total deposits per token
+    mapping(address => uint256) public totalDeposited;
 
-    /// @notice Mapping of user vault balances
-    mapping(address => uint256) private vaults;
+    /// @notice Emitted when a deposit is made
+    event Deposited(address indexed user, address indexed token, uint256 amount);
 
-    /// @notice Emitted when a user successfully deposits ETH
-    /// @param user Address of the depositor
-    /// @param amount Amount deposited in wei
-    event Deposited(address indexed user, uint256 amount);
+    /// @notice Emitted when a withdrawal is made
+    event Withdrawn(address indexed user, address indexed token, uint256 amount);
 
-    /// @notice Emitted when a user successfully withdraws ETH
-    /// @param user Address of the withdrawer
-    /// @param amount Amount withdrawn in wei
-    event Withdrawn(address indexed user, uint256 amount);
-
-    /// @notice Reverts if deposit exceeds global cap
-    error DepositLimitReached();
-
-    /// @notice Reverts if withdrawal exceeds per-transaction limit
-    error WithdrawLimitExceeded();
+    /// @notice Reverts if deposit exceeds USD cap
+    error BankCapExceeded();
 
     /// @notice Reverts if user has insufficient balance
     error InsufficientBalance();
 
-    /// @dev Modifier to ensure deposit does not exceed global cap
-    /// @param amount Amount being deposited
-    modifier withinBankCap(uint256 amount) {
-        if (totalDeposited + amount > bankCap) revert DepositLimitReached();
-        _;
+    constructor(address _priceFeed) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        priceFeed = AggregatorV3Interface(_priceFeed);
     }
 
-    /// @notice Initializes the contract with deposit and withdrawal limits
-    /// @param _bankCap Maximum total deposits allowed
-    /// @param _withdrawLimit Maximum withdrawal per transaction
-    constructor(uint256 _bankCap, uint256 _withdrawLimit) {
-        bankCap = _bankCap;
-        withdrawLimit = _withdrawLimit;
+    /// @notice Deposit ETH into vault
+    function depositETH() external payable {
+        uint256 normalized = normalizeDecimals(address(0), msg.value);
+        if (getTotalUSD() + normalized > BANK_CAP_USD) revert BankCapExceeded();
+
+        balances[msg.sender][address(0)] += msg.value;
+        totalDeposited[address(0)] += msg.value;
+        emit Deposited(msg.sender, address(0), msg.value);
     }
 
-    /// @notice Allows users to deposit ETH into their personal vault
-    /// @dev Uses checks-effects-interactions pattern
-    function deposit() external payable withinBankCap(msg.value) {
-        uint256 amount = msg.value;
-        vaults[msg.sender] += amount;
-        totalDeposited += amount;
-        depositCount++;
-        emit Deposited(msg.sender, amount);
-    }
-    /// @notice Allows users to withdraw ETH from their vault within the allowed limit
-    /// @param amount Amount to withdraw in wei
-    function withdraw(uint256 amount) external {
-        uint256 userBalance = vaults[msg.sender];
+    /// @notice Withdraw ETH from vault
+    /// @param amount Amount to withdraw
+    function withdrawETH(uint256 amount) external {
+        if (balances[msg.sender][address(0)] < amount) revert InsufficientBalance();
 
-        if (amount > withdrawLimit) revert WithdrawLimitExceeded();
-        if (userBalance < amount) revert InsufficientBalance();
-
-        vaults[msg.sender] = userBalance - amount;
-        totalDeposited -= amount;
-        withdrawalCount++;
-        emit Withdrawn(msg.sender, amount);
+        balances[msg.sender][address(0)] -= amount;
+        totalDeposited[address(0)] -= amount;
+        emit Withdrawn(msg.sender, address(0), amount);
         _safeTransfer(msg.sender, amount);
     }
 
-    /// @notice Returns the current vault balance of a user
-    /// @param user Address to query
-    /// @return Balance in wei
-    function viewVault(address user) external view returns (uint256) {
-        return vaults[user];
+    /// @notice Withdraw ERC-20 token from vault
+    /// @param token Address of the token
+    /// @param amount Amount to withdraw
+    function withdrawToken(address token, uint256 amount) external {
+        if (balances[msg.sender][token] < amount) revert InsufficientBalance();
+
+        balances[msg.sender][token] -= amount;
+        totalDeposited[token] -= amount;
+        emit Withdrawn(msg.sender, token, amount);
+        IERC20(token).transfer(msg.sender, amount);
     }
 
-    /// @dev Performs a safe ETH transfer using call
-    /// @param to Recipient address
-    /// @param amount Amount to transfer in wei
-    function _safeTransfer(address to, uint256 amount) private {
+    /// @notice Normalize token amount to 6 decimals (USDC standard)
+    /// @param token Address of the token
+    /// @param amount Original amount
+    /// @return Normalized amount
+    function normalizeDecimals(address token, uint256 amount) internal view returns (uint256) {
+        if (token == address(0)) return convertETHtoUSD(amount);
+        uint8 decimals = IERC20Metadata(token).decimals();
+        if (decimals > 6) return amount / (10 ** (decimals - 6));
+        else return amount * (10 ** (6 - decimals));
+    }
+
+    /// @notice Convert ETH amount to USD using Chainlink
+    /// @param amount ETH amount in wei
+    /// @return USD value scaled to 6 decimals
+    function convertETHtoUSD(uint256 amount) public view returns (uint256) {
+        (, int price,,,) = priceFeed.latestRoundData(); // ETH/USD with 8 decimals
+        require(price > 0, "Invalid price");
+        return (amount * uint256(price)) / 1e20; // Convert wei to USD with 6 decimals
+    }
+
+    /// @notice Get total USD value across all tokens
+    /// @return Total USD value scaled to 6 decimals
+    function getTotalUSD() public view returns (uint256) {
+        uint256 ethUSD = convertETHtoUSD(totalDeposited[address(0)]);
+        // Extend to include ERC-20 tokens if needed
+        return ethUSD;
+    }
+
+    /// @dev Safe ETH transfer using call
+    function _safeTransfer(address to, uint256 amount) internal {
         (bool success, ) = to.call{value: amount}("");
         require(success, "Transfer failed");
     }
